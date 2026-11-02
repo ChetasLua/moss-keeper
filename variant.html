@@ -1,0 +1,908 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Moss Keeper — procedural variant</title>
+<meta name="description" content="A procedurally painted, hand-inked style variant of The Moss Keeper: a mossy giant wakes at sunrise and launches into the sky. Single file, canvas 2D, no video.">
+<style>
+html,body{margin:0;height:100%;background:#0b0a09;overflow:hidden}
+#stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#0b0a09}
+#c{display:block;width:min(100vw,calc(100vh * 1920 / 1040));height:auto;aspect-ratio:1920/1040;cursor:pointer}
+#end{position:fixed;left:0;right:0;bottom:9%;text-align:center;color:#f3ead8;font:400 clamp(22px,3.6vw,44px) Georgia,"Palatino Linotype",serif;letter-spacing:.12em;text-shadow:0 2px 24px rgba(0,0,0,.6);opacity:0;transition:opacity 2.2s ease;pointer-events:none}
+#end.on{opacity:1}
+#hint{position:fixed;left:0;right:0;bottom:10px;text-align:center;color:#f3ead8;opacity:.55;font:14px Georgia,serif;letter-spacing:.06em;pointer-events:none;transition:opacity .8s}
+#hint.off{opacity:0}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" width="1920" height="1040" aria-label="The Moss Keeper, procedural anime-style scene"></canvas></div>
+<div id="end">The Moss Keeper</div>
+<div id="hint">Click to pause · R to restart</div>
+<script>
+(function(){
+'use strict';
+
+/* ------------------------------------------------------------------
+   The Moss Keeper — variant
+   Everything is drawn with the 2D canvas API at a fixed 1920x1040
+   world. Static painted layers are built once (the "background
+   artist's" pass); the robot is rebuilt from a pose each frame with
+   cel shading, hand-inked outlines and a fixed design; particles
+   (leaves, soil, birds, butterflies, mist puffs) are simulated
+   deterministically so any time t always gives the same frame.
+   Robot motion is stepped on twos (12 drawings per second), the
+   way hand-drawn anime is timed.
+------------------------------------------------------------------- */
+
+const W = 1920, H = 1040;
+const WT = -700, WB = 1040, WH = WB - WT;   // world y range: sky extends above the frame for the camera to rise into
+const GY = 860, GROUND = 850, CX = 1080, U = 560, DUR = 58;
+const INK = '#2b2321';
+
+const cv = document.getElementById('c');
+let ctx = cv.getContext('2d');
+
+/* ---------- deterministic helpers ---------- */
+function hash(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return h>>>0}
+function mulberry(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+let R = mulberry(20251102);                       // painter's randomness (static layers only)
+const rnd = (a=0,b=1) => a + (b-a)*R();
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const sst = (a,b,x) => { const t = clamp((x-a)/(b-a)); return t*t*(3-2*t); };
+const hashU = n => { const x = Math.sin(n*127.1 + 311.7)*43758.5453; return x - Math.floor(x); };
+const mid2 = (a,b) => [(a[0]+b[0])/2, (a[1]+b[1])/2];
+const mix3 = (a,b,t) => [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t];
+const rgb = c => `rgb(${c[0]|0},${c[1]|0},${c[2]|0})`;
+
+/* ---------- path helpers ---------- */
+// closed smooth outline through points (quadratic midpoint smoothing: no polygon corners)
+function smooth(pts){
+  const n = pts.length; ctx.beginPath();
+  const m = (a,b) => [(a[0]+b[0])/2, (a[1]+b[1])/2];
+  const s = m(pts[n-1], pts[0]); ctx.moveTo(s[0], s[1]);
+  for(let i=0;i<n;i++){ const p = pts[i], q = m(p, pts[(i+1)%n]); ctx.quadraticCurveTo(p[0], p[1], q[0], q[1]); }
+  ctx.closePath();
+}
+function blobPts(cx,cy,rx,ry,n,seed,amt){
+  const p=[]; for(let j=0;j<n;j++){ const a=j/n*Math.PI*2, k=1+amt*(hashU(seed*31+j)-0.5); p.push([cx+Math.cos(a)*rx*k, cy+Math.sin(a)*ry*k]); }
+  return p;
+}
+function ell(cx,cy,rx,ry,n){ const p=[]; for(let i=0;i<n;i++){ const a=i/n*Math.PI*2; p.push([cx+Math.cos(a)*rx, cy+Math.sin(a)*ry]); } return p; }
+// capsule (limb) outline: rounded at both ends
+function capsule(p0,p1,r0,r1,seg){
+  const dx=p1[0]-p0[0], dy=p1[1]-p0[1], ang=Math.atan2(dy,dx), pts=[];
+  for(let i=0;i<=seg;i++){ const a=ang+Math.PI/2+Math.PI*i/seg; pts.push([p0[0]+Math.cos(a)*r0, p0[1]+Math.sin(a)*r0]); }
+  for(let i=0;i<=seg;i++){ const a=ang-Math.PI/2+Math.PI*i/seg; pts.push([p1[0]+Math.cos(a)*r1, p1[1]+Math.sin(a)*r1]); }
+  return pts;
+}
+// tiny per-part hand-drawn irregularity, fixed per part name so the design never changes
+const JIT = {};
+function jit(name, pts, amt){
+  if(!JIT[name]){ const r = mulberry(hash(name)); JIT[name] = pts.map(()=>[(r()-.5)*2*amt, (r()-.5)*2*amt]); }
+  const J = JIT[name];
+  return pts.map((p,i)=>[p[0]+J[i][0], p[1]+J[i][1]]);
+}
+
+/* ---------- robot transform (local unit space -> world px) ---------- */
+const RB = {ox:CX, oy:GY, s:1, c:1, sn:0};
+function setRB(st){ RB.ox=st.x; RB.oy=GY-st.L; RB.s=st.s; RB.c=Math.cos(st.rot); RB.sn=Math.sin(st.rot); }
+function T(p){ const x=p[0]*U*RB.s, y=p[1]*U*RB.s; return [RB.ox + x*RB.c - y*RB.sn, RB.oy + x*RB.sn + y*RB.c]; }
+const TP = pts => pts.map(T);
+
+/* ---------- ink: hand-inked outline with pressure variation ----------
+   Lines are heavier on the side away from the light (lower right),
+   thinner on the lit side, and each edge gets a fixed wobble. */
+function ink(sp, wHi=2.6, wLo=1.05){
+  const n=sp.length; let area=0;
+  for(let i=0;i<n;i++){ const a=sp[i], b=sp[(i+1)%n]; area += a[0]*b[1]-b[0]*a[1]; }
+  const sg = area>0 ? 1 : -1;
+  ctx.lineCap='round'; ctx.strokeStyle=INK;
+  for(let i=0;i<n;i++){
+    const a=sp[i], b=sp[(i+1)%n];
+    const ex=b[0]-a[0], ey=b[1]-a[1], L=Math.hypot(ex,ey)||1;
+    const nx=ey/L*sg, ny=-ex/L*sg;
+    const d = nx*-0.6 + ny*-0.8;                 // >0: faces the light
+    ctx.lineWidth = (d < -0.15 ? wHi : wLo) * RB.s * (0.75 + 0.5*hashU(i + n*7 + 3));
+    ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke();
+  }
+}
+
+/* ---------- cel fill: flat base colour, hard-edged shadow band on the lower right ---------- */
+function celFill(sp, base, shade, sh){
+  ctx.save();
+  smooth(sp); ctx.fillStyle=shade; ctx.fill(); ctx.clip();
+  smooth(sp.map(p=>[p[0]+sh, p[1]+sh])); ctx.fillStyle=base; ctx.fill();
+  ctx.restore();
+}
+
+/* ============================================================
+   STATIC PAINTED LAYERS (built once)
+   ============================================================ */
+let BG = null, FRONT = null, GRASS = [], GRAIN = null;
+const PALG = [
+  ['#2c4a36','#4f7d43','#9cc465'],
+  ['#34563a','#5f8f48','#bcd67f'],
+  ['#2a4a3f','#3f6e4c','#7fae6a'],
+  ['#3b5a2a','#6e9a3e','#d8dc8e'],
+];
+
+// a foliage clump painted like gouache: dark mass, lit mass, highlight dabs and brush strokes
+function clump(cx,cy,r,pal,seed){
+  const pts = blobPts(cx,cy,r*1.1,r*0.8,11,seed,0.42);
+  smooth(pts); ctx.fillStyle=pal[0]; ctx.fill();
+  ctx.save(); smooth(pts); ctx.clip();
+  smooth(pts.map(p=>[p[0]-r*0.16, p[1]-r*0.24])); ctx.fillStyle=pal[1]; ctx.fill();
+  for(let j=0;j<5;j++){
+    const x = cx - r*0.5 + hashU(seed*7+j)*r*0.9, y = cy - r*0.5 + hashU(seed*9+j)*r*0.4;
+    smooth(blobPts(x,y,r*0.22,r*0.12,6,seed+j,0.5)); ctx.fillStyle=pal[2]; ctx.globalAlpha=0.75; ctx.fill(); ctx.globalAlpha=1;
+  }
+  ctx.lineCap='round';
+  for(let j=0;j<9;j++){
+    const x = cx + (hashU(seed*11+j)-0.5)*r*1.8, y = cy + (hashU(seed*13+j)-0.5)*r*1.2;
+    const a = hashU(seed*17+j)*Math.PI, L = r*(0.25+0.3*hashU(seed*19+j));
+    ctx.strokeStyle = pal[(j%3)]; ctx.globalAlpha = 0.28; ctx.lineWidth = r*0.1;
+    ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(x+Math.cos(a)*L, y+Math.sin(a)*L*0.5); ctx.stroke();
+  }
+  ctx.globalAlpha=1; ctx.restore();
+}
+
+// broad painterly brush field: many soft translucent strokes with colour variation
+function brushField(x0,y0,w,h,count,pal,a0,a1,lw0,lw1){
+  ctx.lineCap='round';
+  for(let i=0;i<count;i++){
+    const x=x0+R()*w, y=y0+R()*h, L=60+R()*240, a=(R()-.5)*0.25;
+    ctx.strokeStyle=pal[(R()*pal.length)|0]; ctx.globalAlpha=a0+R()*(a1-a0);
+    ctx.lineWidth=lw0+R()*(lw1-lw0);
+    ctx.beginPath(); ctx.moveTo(x,y);
+    ctx.quadraticCurveTo(x+Math.cos(a)*L*0.5+(R()-.5)*20, y+Math.sin(a)*L*0.5+(R()-.5)*12, x+Math.cos(a)*L, y+Math.sin(a)*L);
+    ctx.stroke();
+  }
+  ctx.globalAlpha=1;
+}
+
+function hillLine(base,amp,seed,col,alpha){
+  const pts=[];
+  for(let x=-20;x<=W+20;x+=30){
+    pts.push([x, base + amp*Math.sin(x*0.0038+seed) + amp*0.5*Math.sin(x*0.0121+seed*2.3) + 6*(hashU(x*0.07+seed)-0.5)]);
+  }
+  ctx.beginPath(); ctx.moveTo(-20,WB); pts.forEach(p=>ctx.lineTo(p[0],p[1])); ctx.lineTo(W+20,WB); ctx.closePath();
+  ctx.fillStyle=col; ctx.globalAlpha=alpha; ctx.fill(); ctx.globalAlpha=1;
+}
+
+// trunk: lit left side, shadow right, bark strokes, ink outline
+function trunk(x,yTop,yBot,w0,w1,lean,seed,pal){
+  const N=18, Lf=[], Rt=[];
+  const cen = u => x + lean*(1-u)*(1-u) + 7*Math.sin(u*5.2+seed);
+  const wid = u => lerp(w0,w1,u) * (1 + 0.06*Math.sin(u*17+seed));
+  for(let i=0;i<=N;i++){ const u=i/N, y=lerp(yTop,yBot,u), c=cen(u), w=wid(u); Lf.push([c-w/2,y]); Rt.push([c+w/2,y]); }
+  const outline = Lf.concat(Rt.slice().reverse());
+  ctx.beginPath(); outline.forEach((p,i)=> i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1])); ctx.closePath();
+  ctx.fillStyle=pal.dark; ctx.fill();
+  ctx.save(); ctx.clip();
+  const Md = Lf.map((p,i)=>[(p[0]+Rt[i][0])/2 - wid(i/N)*0.08, p[1]]);
+  ctx.beginPath(); Lf.forEach((p,i)=> i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]));
+  Md.slice().reverse().forEach(p=>ctx.lineTo(p[0],p[1])); ctx.closePath();
+  ctx.fillStyle=pal.mid; ctx.fill();
+  ctx.lineCap='round';
+  for(let j=0;j<12;j++){
+    const u0=hashU(seed*3+j)*0.9, off=(hashU(seed*5+j)-0.5)*0.8, len=0.08+0.2*hashU(seed*7+j);
+    ctx.strokeStyle=pal.bark; ctx.globalAlpha=0.55; ctx.lineWidth=1+2*hashU(seed*9+j);
+    ctx.beginPath();
+    for(let s=0;s<=8;s++){ const u=u0+len*s/8; if(u>1) break; const px=cen(u)+off*wid(u)*0.5, py=lerp(yTop,yBot,u); s?ctx.lineTo(px,py):ctx.moveTo(px,py); }
+    ctx.stroke();
+  }
+  ctx.globalAlpha=1; ctx.restore();
+  ink(outline, 2.2, 1.0);
+}
+
+function paintBackground(){
+  // sky: cool blue above, pale green, then the warm sunrise band at the horizon
+  const g = ctx.createLinearGradient(0,WT,0,700);
+  g.addColorStop(0,'#6e9dae'); g.addColorStop(0.34,'#a6c9c0'); g.addColorStop(0.52,'#ece4bc');
+  g.addColorStop(0.68,'#f8d79d'); g.addColorStop(1,'#f0b48a');
+  ctx.fillStyle=g; ctx.fillRect(0,WT,W,WH);
+  brushField(0,WT,W,1400,520,['#7fb0bb','#b5d6c9','#f3e6b8','#f6cf98','#e6dcae'],0.04,0.11,6,28);
+
+  // high cloud streaks, rose and cream
+  for(let i=0;i<26;i++){
+    const x=R()*W, y=-170+R()*300, rx=170+R()*280, ry=8+R()*16;
+    smooth(blobPts(x,y,rx,ry,12,i+900,0.5));
+    ctx.fillStyle = R()<.5 ? 'rgba(242,190,180,.42)' : 'rgba(255,242,214,.55)'; ctx.fill();
+  }
+
+  // distant ridges, pale and misted
+  hillLine(612,26,1.3,'#b7cfc6',0.95);
+  brushField(0,560,W,120,120,['#c7dcd1','#aecbbf'],0.05,0.12,8,20);
+  hillLine(688,22,2.1,'#93b6a9',0.95);
+
+  // far forest: thin pale trunks and small crowns
+  for(let i=0;i<150;i++){
+    const x=R()*W, base=735+R()*60, h=170+R()*230, w=3+R()*6;
+    ctx.fillStyle='rgba(118,156,150,.78)';
+    ctx.fillRect(x-w/2, base-h, w, h+40);
+    clump(x, base-h, 26+R()*40, ['#7ea49a','#9dbfb0','#cbdfcc'], i+4000);
+  }
+
+  // mid trunks: framing the scene, leaving the centre open for the robot
+  const dark={dark:'#3a2e25',mid:'#6e5842',bark:'#241c17'};
+  const mossy={dark:'#33382a',mid:'#5f6a45',bark:'#1f231a'};
+  trunk(40,-700,900,70,96,-20,1,dark);
+  trunk(255,-700,900,44,52,14,2,dark);
+  trunk(438,-700,900,30,36,-8,3,dark);
+  trunk(588,-700,880,24,28,6,4,mossy);
+  trunk(960,-700,800,22,24,4,5,mossy);      // far trunk behind the robot
+  trunk(1205,-700,780,16,20,-6,6,mossy);
+  trunk(1338,-700,900,26,32,-6,7,dark);
+  trunk(1502,-700,900,42,50,8,8,dark);
+  trunk(1694,-700,900,58,66,12,9,dark);
+  trunk(1880,-700,900,84,100,-14,10,dark);
+
+  // canopy: back layer of foliage (leaves a gap above the robot's head for the sunbeam)
+  for(let i=0;i<260;i++){
+    const x=R()*W, y=-150+R()*380;
+    if(x>1000 && x<1340 && y<330) continue;
+    clump(x, y, 40+R()*72, PALG[(R()*4)|0], i+100);
+  }
+
+  // meadow: sunlit centre, shadowed edges
+  const mg = ctx.createLinearGradient(0,790,0,WB);
+  mg.addColorStop(0,'#9fb664'); mg.addColorStop(0.45,'#6f8f45'); mg.addColorStop(1,'#354f26');
+  ctx.fillStyle=mg; ctx.fillRect(-20,790,W+40,WB-790+20);
+  brushField(0,800,W,240,420,['#b8c97c','#88a455','#5a7a3a','#d9e096'],0.05,0.16,4,16);
+  const sunPatch = ctx.createRadialGradient(CX+40,880,20,CX+40,880,620);
+  sunPatch.addColorStop(0,'rgba(255,240,180,.42)'); sunPatch.addColorStop(1,'rgba(255,240,180,0)');
+  ctx.fillStyle=sunPatch; ctx.fillRect(0,780,W,300);
+
+  // wildflowers in the meadow
+  for(let i=0;i<340;i++){
+    const x=R()*W, y=830+R()*190, c = R()<.6 ? '#fbf7ea' : (R()<.5 ? '#f3c7cc' : '#f5e08a');
+    ctx.fillStyle=c; ctx.beginPath(); ctx.arc(x,y,1.2+R()*1.8,0,7); ctx.fill();
+  }
+}
+
+function paintFront(){
+  // side foliage that overlaps the trunks and frames the robot from both sides
+  for(let i=0;i<170;i++){
+    const side = R()<.5;
+    const x = side ? -40+R()*760 : 1400+R()*560;
+    const y = -120+R()*420;
+    clump(x, y, 52+R()*90, PALG[(R()*4)|0], i+6000);
+  }
+  // hanging vines with leaves
+  for(let i=0;i<60;i++){
+    const side = R()<.5, x = side ? R()*720 : 1420+R()*500;
+    const y0 = -140+R()*60, L = 120+R()*240;
+    ctx.strokeStyle='rgba(38,64,40,.9)'; ctx.lineWidth=2.4;
+    ctx.beginPath(); ctx.moveTo(x,y0);
+    ctx.quadraticCurveTo(x+(R()-.5)*60, y0+L*0.5, x+(R()-.5)*30, y0+L); ctx.stroke();
+    for(let j=0;j<7;j++){
+      const yy=y0+L*(0.25+0.1*j), xx=x+(R()-.5)*26;
+      clump(xx, yy, 10+R()*8, PALG[j%4], i*11+j+7000);
+    }
+  }
+  // low bushes at the trunk bases
+  for(let i=0;i<40;i++){
+    const side = R()<.5, x = side ? R()*540 : 1560+R()*380, y = 800+R()*60;
+    clump(x, y, 46+R()*60, PALG[(R()*4)|0], i+8000);
+  }
+  // out-of-focus foreground leaves, dark and close (depth)
+  for(let i=0;i<22;i++){
+    const side = R()<.5, x = side ? -60+R()*300 : 1660+R()*320, y = 930+R()*160;
+    ctx.globalAlpha=0.9;
+    clump(x, y, 110+R()*90, ['#16281f','#22382b','#34503a','#0e1a14'], i+9000);
+    ctx.globalAlpha=1;
+  }
+}
+
+function buildStatic(){
+  R = mulberry(20251102);
+  BG = document.createElement('canvas'); BG.width=W; BG.height=WH;
+  FRONT = document.createElement('canvas'); FRONT.width=W; FRONT.height=WH;
+  const old = ctx;
+  ctx = BG.getContext('2d'); ctx.setTransform(1,0,0,1,0,-WT); RB.s=1; paintBackground();
+  ctx = FRONT.getContext('2d'); ctx.setTransform(1,0,0,1,0,-WT); paintFront();
+  ctx = old;
+  // grass blades: drawn live so they can bend in the wind
+  GRASS = [];
+  R = mulberry(4242);
+  for(let i=0;i<620;i++){
+    const y = 840 + R()*190, depth = (y-840)/190;
+    GRASS.push({x:R()*W, y, h:24+depth*80+R()*26, lean:(R()-.5)*18, w:1.6+depth*2.2,
+      c: R()<.5 ? `rgb(${70+depth*20|0},${105+depth*30|0},${44})` : `rgb(${110+depth*30|0},${150+depth*30|0},${64})`});
+  }
+  // film grain tile (static, so no flicker)
+  GRAIN = document.createElement('canvas'); GRAIN.width=256; GRAIN.height=256;
+  const gg = GRAIN.getContext('2d'), gi = gg.createImageData(256,256);
+  R = mulberry(77);
+  for(let i=0;i<gi.data.length;i+=4){ const q=128+(R()-.5)*120; gi.data[i]=gi.data[i+1]=gi.data[i+2]=q; gi.data[i+3]=255; }
+  gg.putImageData(gi,0,0);
+  R = mulberry(20251102);
+}
+
+/* ============================================================
+   ROBOT: a fixed design (heavy torso, round shoulder vents,
+   visor head with glowing eyes, chest core), posed every frame
+   ============================================================ */
+const C = {
+  steel:'#97a6a1', steelSh:'#56676b',
+  head:'#a9b1a6', headSh:'#67716b',
+  leg:'#7f8f8d', legSh:'#434e50',
+  pod:'#8f7c66', podSh:'#4d4034',
+  belt:'#65533f', beltSh:'#372c24',
+  red:'#a64f3a', redSh:'#5f2c23',
+  core:'#4a4038', coreRim:'#5b4b40'
+};
+const MOSSP = [['#2f4d2d','#5b8a3c','#a6cc62'],['#3a5a2e','#739f46','#c3dc7b'],['#23402c','#4c7a46','#8fbe6c']];
+
+function pose(k,h){
+  const M=(a,b)=>a+(b-a)*k, P=(a,b)=>[M(a[0],b[0]),M(a[1],b[1])];
+  const top=M(-0.46,-0.64), bot=M(-0.20,-0.40), mid=(top+bot)/2, hipY=bot+0.02;
+  const th = 0.06 - 0.42*h;                       // head tilts up as it lifts its face to the gap
+  const hc = top-0.15;
+  const rot = p => { const c=Math.cos(th), s=Math.sin(th), x=p[0], y=p[1]-top; return [x*c-y*s, top+x*s+y*c]; };
+  const leg = sd => {
+    const hip=[sd*0.12,hipY], knee=P([sd*0.25,-0.07],[sd*0.13,-0.21]), foot=P([sd*0.12,-0.015],[sd*0.14,-0.012]);
+    return {thigh:capsule(hip,knee,0.075,0.062,8), shin:capsule(knee,foot,0.062,0.05,8), knee, foot, thighMid:mid2(hip,knee), shinMid:mid2(knee,foot)};
+  };
+  const arm = sd => {
+    const sh=[sd*0.24,top+0.05], el=P([sd*0.33,-0.2],[sd*0.34,-0.44]), hd=P([sd*0.38,-0.02],[sd*0.37,-0.24]);
+    return {up:capsule(sh,el,0.058,0.05,8), fore:capsule(el,hd,0.05,0.045,8), sh, el, hd, upMid:mid2(sh,el)};
+  };
+  const L1=leg(-1), R1=leg(1), A1=arm(-1), A2=arm(1);
+  const head=[];
+  for(let i=0;i<26;i++){ const a=i/26*Math.PI*2, c=Math.cos(a), s=Math.sin(a);
+    head.push(rot([0.118*Math.sign(c)*Math.pow(Math.abs(c),0.42), hc+0.105*Math.sign(s)*Math.pow(Math.abs(s),0.42)])); }
+  const torso=[[-0.16,top+0.03],[-0.08,top-0.01],[0.08,top-0.01],[0.16,top+0.03],[0.21,mid],[0.19,bot],[-0.19,bot],[-0.21,mid]];
+  const belt=[[-0.20,bot-0.07],[0.20,bot-0.07],[0.19,bot-0.02],[-0.19,bot-0.02]];
+  const pods=[-1,1].map(sd=>ell(sd*0.27, top+0.04, 0.085, 0.085, 14));
+  const eye = (sd,ry) => ell(sd*0.045, hc+0.004, 0.032, ry, 10).map(rot);
+  const visor = ell(0, hc+0.004, 0.10, 0.035, 14).map(rot);
+  const anc = {
+    head: rot([0,hc]), torso:[0,mid], shL:A1.sh, shR:A2.sh, elL:A1.el, elR:A2.el,
+    kneeL:L1.knee, kneeR:R1.knee, footL:L1.foot, footR:R1.foot,
+    thighL:L1.thighMid, thighR:R1.thighMid, shinL:L1.shinMid, shinR:R1.shinMid,
+    headBack: rot([0.03,hc-0.04]), perch:[0.27, top-0.07]
+  };
+  return {top,mid,bot,hc,rot,L1,R1,A1,A2,head,torso,belt,pods,eye,visor,anc,
+    neck: capsule([0,top+0.01],[0,top-0.07],0.045,0.04,6),
+    chest: ell(0,mid,0.086,0.086,18), chestIn: ell(0,mid,0.066,0.066,18),
+    fins: [capsule(rot([-0.09,hc-0.03]),rot([-0.2,hc-0.11]),0.022,0.012,5), capsule(rot([0.09,hc-0.03]),rot([0.2,hc-0.11]),0.022,0.012,5)]
+  };
+}
+
+// moss clumps, anchored to body parts so they stay on the body as it moves
+const MOSS = [
+ ['head',-0.11,0.00,0.05,0],['head',0.10,-0.05,0.06,1],['head',0.00,-0.12,0.055,2],['head',-0.06,0.09,0.03,1],['head',0.12,0.05,0.035,2],
+ ['torso',-0.14,-0.14,0.07,1],['torso',0.12,-0.12,0.065,0],['torso',-0.02,-0.02,0.04,2],['torso',0.13,0.10,0.05,1],['torso',-0.15,0.09,0.05,0],
+ ['shL',-0.02,-0.06,0.06,0],['shR',0.02,-0.07,0.07,1],['shR',0.05,0.04,0.04,2],['shL',0.0,0.08,0.04,2],
+ ['kneeL',0.0,-0.06,0.05,1],['kneeR',0.02,-0.05,0.055,0],['kneeL',-0.04,0.02,0.035,2],['thighR',0.0,-0.06,0.045,2],
+ ['shinL',-0.03,-0.02,0.04,0],['shinR',0.02,-0.05,0.04,1]
+];
+// rust, bare paint and red-trim chips
+const CHIPS = [
+ ['torso',-0.10,0.02,0.012,0],['torso',0.11,-0.02,0.01,1],['torso',0.05,0.09,0.012,0],['torso',-0.05,-0.10,0.01,2],
+ ['head',0.07,0.05,0.011,1],['head',-0.09,-0.03,0.01,0],['shL',0.05,-0.02,0.01,2],['shR',-0.04,0.05,0.012,0],
+ ['kneeR',-0.04,0.02,0.01,1],['thighL',0.04,0.02,0.01,0],['shinR',0.03,0.04,0.009,1]
+];
+const CHIPC = ['#9c5630','#c9b48e','#8a3b2c'];
+
+function mossAt(lx,ly,r,seed,pal){
+  const base = blobPts(lx,ly,r,r*0.78,9,seed,0.45).map(T);
+  smooth(base); ctx.fillStyle=pal[0]; ctx.fill();
+  ctx.save(); smooth(base); ctx.clip();
+  smooth(base.map(p=>[p[0]-r*U*RB.s*0.16, p[1]-r*U*RB.s*0.22])); ctx.fillStyle=pal[1]; ctx.fill();
+  smooth(blobPts(lx-r*0.3,ly-r*0.35,r*0.35,r*0.2,6,seed+5,0.4).map(T)); ctx.fillStyle=pal[2]; ctx.fill();
+  ctx.restore();
+  // wildflowers on the moss
+  const f = T([lx+r*0.1, ly-r*0.6]);
+  if(hashU(seed*2+1) > 0.35){
+    ctx.fillStyle='#fbf6e6'; ctx.beginPath(); ctx.arc(f[0],f[1],2.2*RB.s+0.6,0,7); ctx.fill();
+    ctx.fillStyle='#f0c85a'; ctx.beginPath(); ctx.arc(f[0],f[1],0.9*RB.s+0.3,0,7); ctx.fill();
+  }
+  if(hashU(seed*2+9) > 0.6){
+    const g = T([lx-r*0.5, ly-r*0.2]);
+    ctx.fillStyle='#f3c7cc'; ctx.beginPath(); ctx.arc(g[0],g[1],1.8*RB.s+0.5,0,7); ctx.fill();
+  }
+}
+
+// a painted vine: a stroked curve with small leaves along it
+function vine(pts,seed){
+  const w = pts.map(T);
+  ctx.strokeStyle='#2f4a2c'; ctx.lineWidth=2.6*RB.s; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(w[0][0],w[0][1]);
+  for(let i=1;i<w.length-1;i++){ const m=mid2(w[i],w[i+1]); ctx.quadraticCurveTo(w[i][0],w[i][1],m[0],m[1]); }
+  ctx.lineTo(w[w.length-1][0],w[w.length-1][1]); ctx.stroke();
+  for(let i=1;i<pts.length;i++){
+    const p=pts[i], off=(hashU(seed+i)-0.5)*0.06;
+    mossAt(p[0]+off, p[1], 0.024, seed*5+i, MOSSP[(i+seed)%3]);
+  }
+}
+
+// robot silhouette, drawn back to front with cel shading and ink
+function part(name, pts, base, shade){
+  const sp = TP(jit(name, pts, 0.005));
+  const sh = 6.5*RB.s;
+  celFill(sp, base, shade, -sh);
+  ink(sp);
+  return sp;
+}
+
+function exhaust(t,P,st){
+  const e = sst(33,37,t) * (1 - 0.25*sst(48,56,t));
+  if(e<=0.01) return;
+  const down=[-RB.sn, RB.c];
+  ctx.save(); ctx.globalCompositeOperation='lighter';
+  for(const fp of [P.anc.footL, P.anc.footR]){
+    const f = T(fp);
+    const len = (150+220*sst(37,44,t))*e*RB.s + 40;
+    const end = [f[0]+down[0]*len, f[1]+down[1]*len];
+    const g = ctx.createRadialGradient(f[0],f[1],0,f[0],f[1],110*RB.s*e+30);
+    g.addColorStop(0,`rgba(255,246,206,${0.85*e})`); g.addColorStop(0.35,`rgba(255,184,96,${0.42*e})`); g.addColorStop(1,'rgba(255,160,80,0)');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(f[0],f[1],110*RB.s*e+30,0,7); ctx.fill();
+    const pw = 34*RB.s*e;
+    const pg = ctx.createLinearGradient(f[0],f[1],end[0],end[1]);
+    pg.addColorStop(0,`rgba(255,248,220,${0.8*e})`); pg.addColorStop(0.4,`rgba(255,190,110,${0.35*e})`); pg.addColorStop(1,'rgba(255,160,90,0)');
+    ctx.fillStyle=pg; ctx.beginPath();
+    ctx.moveTo(f[0]-pw*0.5, f[1]); ctx.quadraticCurveTo(f[0]+down[0]*len*0.5, f[1]+down[1]*len*0.5, end[0], end[1]);
+    ctx.quadraticCurveTo(f[0]+down[0]*len*0.5, f[1]+down[1]*len*0.5, f[0]+pw*0.5, f[1]); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function chestGlow(t){
+  if(t<11) return 0;
+  if(t<15){
+    // the faint light flickers on: a stepped, uneven ignition
+    const on = hashU(Math.floor(t*12)*1.7+3) > 0.42 ? 1 : 0.18;
+    return sst(11,15,t) * (0.25 + 0.75*on);
+  }
+  return 1;
+}
+
+function drawRobot(t, st){
+  setRB(st);
+  const P = pose(st.k, st.h);
+  const awake = sst(15,21,t), g = chestGlow(t);
+  if(t>33) exhaust(t,P,st);
+
+  // legs
+  part('thighL', P.L1.thigh, C.leg, C.legSh);
+  part('shinL', P.L1.shin, C.leg, C.legSh);
+  part('thighR', P.R1.thigh, C.leg, C.legSh);
+  part('shinR', P.R1.shin, C.leg, C.legSh);
+
+  // torso and belt
+  part('torso', P.torso, C.steel, C.steelSh);
+  part('belt', P.belt, C.belt, C.beltSh);
+
+  // chest core: dark rim, glowing centre, vent slats; light leaks out of the seams
+  const cRim = TP(P.chest), cIn = TP(P.chestIn);
+  celFill(cRim, C.coreRim, '#2c241f', -3*RB.s); ink(cRim, 2.0, 1.0);
+  const warmC = mix3([58,48,42],[255,196,108],g);
+  celFill(cIn, rgb(warmC), rgb(mix3([30,25,22],[200,120,50],g)), -2*RB.s);
+  const cc = T(P.torso);
+  ctx.save(); ctx.lineCap='round';
+  for(let i=0;i<8;i++){
+    const a=i/8*Math.PI*2+0.2, r0=0.02, r1=0.064;
+    const p0=T([Math.cos(a)*r0, P.mid+Math.sin(a)*r0]), p1=T([Math.cos(a)*r1, P.mid+Math.sin(a)*r1]);
+    ctx.strokeStyle=`rgba(40,30,24,${0.75-0.45*g})`; ctx.lineWidth=2*RB.s;
+    ctx.beginPath(); ctx.moveTo(p0[0],p0[1]); ctx.lineTo(p1[0],p1[1]); ctx.stroke();
+  }
+  if(g>0.02){
+    ctx.globalCompositeOperation='lighter';
+    const rr = U*RB.s*(0.28+0.12*g);
+    const bg = ctx.createRadialGradient(cc[0],cc[1],0,cc[0],cc[1],rr);
+    bg.addColorStop(0,`rgba(255,200,110,${0.7*g})`); bg.addColorStop(0.4,`rgba(255,150,70,${0.25*g})`); bg.addColorStop(1,'rgba(255,140,60,0)');
+    ctx.fillStyle=bg; ctx.beginPath(); ctx.arc(cc[0],cc[1],rr,0,7); ctx.fill();
+  }
+  ctx.restore();
+
+  // round shoulder vents (on-model: they stay the same on every frame)
+  for(let i=0;i<2;i++){
+    const sp = part(i?'podR':'podL', P.pods[i], C.pod, C.podSh);
+    const c = T(i? [0.27, P.top+0.04] : [-0.27, P.top+0.04]);
+    ctx.strokeStyle=INK; ctx.lineWidth=1.2*RB.s;
+    for(let j=0;j<4;j++){ const a=j*Math.PI/2+0.4; const e=[c[0]+Math.cos(a)*34*RB.s, c[1]+Math.sin(a)*34*RB.s];
+      ctx.beginPath(); ctx.moveTo(c[0],c[1]); ctx.lineTo(e[0],e[1]); ctx.stroke(); }
+    ctx.fillStyle='#2a221c'; ctx.beginPath(); ctx.arc(c[0],c[1],8*RB.s,0,7); ctx.fill();
+  }
+
+  // neck, fins, head
+  part('neck', P.neck, C.steelSh, '#3c4648');
+  P.fins.forEach((f,i)=>part('fin'+i, f, C.red, C.redSh));
+  part('head', P.head, C.head, C.headSh);
+  // visor plate and the eyes behind it: awake glow, narrowing with effort
+  const vs = TP(P.visor);
+  celFill(vs, '#2a343a', '#161d22', -2*RB.s); ink(vs, 1.6, 0.9);
+  const eyeRy = lerp(0.005, 0.016, awake) * (1 - 0.25*sst(28,34,t));
+  const eyeCol = mix3([62,80,88],[255,212,118],awake);
+  for(const sd of [-1,1]){
+    const e = TP(P.eye(sd, eyeRy));
+    celFill(e, rgb(eyeCol), rgb(mix3(eyeCol,[200,120,40],0.5)), -1*RB.s);
+    if(awake>0.05){
+      const c = T(P.eye(sd, eyeRy)[0]);
+      ctx.save(); ctx.globalCompositeOperation='lighter';
+      const eg = ctx.createRadialGradient(c[0],c[1],0,c[0],c[1],60*RB.s*awake);
+      eg.addColorStop(0,`rgba(255,210,120,${0.7*awake})`); eg.addColorStop(1,'rgba(255,170,80,0)');
+      ctx.fillStyle=eg; ctx.beginPath(); ctx.arc(c[0],c[1],60*RB.s*awake,0,7); ctx.fill(); ctx.restore();
+    }
+  }
+
+  // moss, vines and chips (over the body)
+  for(const [an,dx,dy,r,pi] of MOSS){
+    const a = P.anc[an]; mossAt(a[0]+dx, a[1]+dy, r, hash(an+dx+dy), MOSSP[pi]);
+  }
+  for(const [an,dx,dy,r,ci] of CHIPS){
+    const a = P.anc[an];
+    const c = [a[0]+dx, a[1]+dy];
+    const q = TP([[c[0]-r,c[1]-r*0.5],[c[0]+r,c[1]-r*0.7],[c[0]+r*0.8,c[1]+r*0.6],[c[0]-r*0.6,c[1]+r*0.5]]);
+    ctx.fillStyle=CHIPC[ci]; smooth(q); ctx.fill();
+  }
+  vine([P.anc.shL,[P.anc.shL[0]-0.03,P.anc.shL[1]+0.10],[P.anc.shL[0]-0.05,P.anc.shL[1]+0.22],[P.anc.shL[0]-0.09,P.anc.shL[1]+0.32]], 11);
+  vine([P.anc.headBack,[P.anc.headBack[0]-0.06,P.anc.headBack[1]+0.07],[P.anc.headBack[0]-0.12,P.anc.headBack[1]+0.13],[P.anc.headBack[0]-0.2,P.anc.headBack[1]+0.16]], 23);
+  vine([P.anc.shR,[P.anc.shR[0]+0.03,P.anc.shR[1]+0.12],[P.anc.shR[0]+0.07,P.anc.shR[1]+0.24]], 37);
+
+  // arms last (in front of the torso)
+  part('upL', P.A1.up, C.steel, C.steelSh);
+  part('foreL', P.A1.fore, C.steel, C.steelSh);
+  part('upR', P.A2.up, C.steel, C.steelSh);
+  part('foreR', P.A2.fore, C.steel, C.steelSh);
+  // hands and chipped red trim on the forearms
+  for(const A of [P.A1,P.A2]){ const hp=T(A.hd); ctx.fillStyle=C.steelSh; ctx.beginPath(); ctx.arc(hp[0],hp[1],10*RB.s,0,7); ctx.fill(); }
+  // weathering: rust streaks drip down from the shoulders
+  ctx.lineCap='round';
+  for(const sd of [-1,1]){
+    const s0 = T([sd*0.2, P.top+0.04]);
+    ctx.strokeStyle='rgba(150,80,44,.55)'; ctx.lineWidth=3*RB.s;
+    ctx.beginPath(); ctx.moveTo(s0[0],s0[1]); ctx.quadraticCurveTo(s0[0]+sd*4*RB.s, s0[1]+60*RB.s, s0[0]-sd*3*RB.s, s0[1]+120*RB.s); ctx.stroke();
+  }
+}
+
+/* ---------- the bird that lands on the shoulder ---------- */
+function birdAt(t, st){
+  // returns null, or {x,y,sc,dir,flap,perched}; the perch follows the robot's current pose
+  if(t<4.4) return null;
+  const perch = T(pose(st.k, st.h).anc.perch);
+  if(t<5.6){
+    const p = sst(4.4,5.6,t);
+    const sx = CX-820, sy = 170;
+    const x = lerp(sx, perch[0], p), y = lerp(sy, perch[1], p) - 180*Math.sin(Math.PI*p);
+    return {x, y, sc:1.7*RB.s, dir:1, flap:Math.sin(t*34), perched:false};
+  }
+  if(t<16.2){
+    return {x:perch[0], y:perch[1], sc:1.7*RB.s, dir:1, flap:0, perched:true, turn: hashU(Math.floor(t*0.8)*3.1)>0.6 ? 1:0};
+  }
+  const d = t-16.2;
+  return {x:perch[0]-260*Math.pow(d,1.5), y:perch[1]-240*Math.pow(d,1.25), sc:1.7*RB.s, dir:-1, flap:Math.sin(t*34), perched:false};
+}
+
+function bird(x,y,sc,flap,dir,perched,turn){
+  ctx.save(); ctx.translate(x,y); ctx.scale(dir,1);
+  ctx.strokeStyle=INK; ctx.lineWidth=1.1;
+  if(!perched){
+    // wings sweep up and down
+    const wy = -12*sc*flap;
+    ctx.beginPath(); ctx.moveTo(-2*sc,-2*sc); ctx.quadraticCurveTo(-7*sc,wy-6*sc,-16*sc,wy); ctx.quadraticCurveTo(-7*sc,wy+3*sc,-1*sc,1*sc); ctx.closePath();
+    ctx.fillStyle='#2f5d9a'; ctx.fill(); ctx.stroke();
+  }
+  const body = [[-9,1],[-3,-5],[5,-5],[10,-1],[7,4],[-2,5],[-9,3]].map(p=>[p[0]*sc,p[1]*sc]);
+  smooth(body); ctx.fillStyle='#4f86c4'; ctx.fill(); ctx.stroke();
+  // belly
+  ctx.beginPath(); ctx.ellipse(1*sc,2.4*sc,5*sc,2.2*sc,0,0,7); ctx.fillStyle='#d9e9f2'; ctx.fill();
+  // head, eye, beak
+  const hy = turn ? -8*sc : -6*sc, hx = turn ? 8*sc : 7*sc;
+  ctx.beginPath(); ctx.arc(hx,hy,4.6*sc,0,7); ctx.fillStyle='#3a72b8'; ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#111'; ctx.beginPath(); ctx.arc(hx+1.4*sc,hy-0.8*sc,0.9*sc+0.3,0,7); ctx.fill();
+  ctx.fillStyle='#e0a040'; ctx.beginPath(); ctx.moveTo(hx+4*sc,hy); ctx.lineTo(hx+7.5*sc,hy+0.8*sc); ctx.lineTo(hx+4*sc,hy+1.8*sc); ctx.closePath(); ctx.fill();
+  // tail
+  ctx.beginPath(); ctx.moveTo(-7*sc,0); ctx.lineTo(-16*sc,-2*sc); ctx.lineTo(-15*sc,3*sc); ctx.closePath(); ctx.fillStyle='#2f5d9a'; ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+/* ---------- butterflies: two wander around the head, then leave ---------- */
+function butterfly(x,y,sc,flap,col,dir){
+  ctx.save(); ctx.translate(x,y); ctx.scale(dir,1);
+  ctx.strokeStyle='#2a2220'; ctx.lineWidth=1;
+  for(const s of [-1,1]){
+    ctx.save(); ctx.scale(Math.max(0.12,Math.abs(flap))*s, 1);
+    ctx.beginPath(); ctx.ellipse(6*sc,-4*sc,9*sc,7*sc,-0.3,0,7); ctx.fillStyle=col; ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(5*sc,5*sc,6*sc,4.5*sc,0.3,0,7); ctx.fillStyle=col; ctx.globalAlpha=0.85; ctx.fill(); ctx.globalAlpha=1; ctx.stroke();
+    ctx.restore();
+  }
+  ctx.fillStyle='#2a2220'; ctx.fillRect(-0.8*sc,-5*sc,1.6*sc,11*sc);
+  ctx.restore();
+}
+function butterflies(t){
+  if(t<3 || t>46) return;
+  const fade = 1 - sst(40,46,t);
+  const list = [
+    {x: 1000 + 220*Math.sin(t*0.33+1.2) + 50*Math.sin(t*0.91), y: 470 + 90*Math.sin(t*0.47), c:'#f2a33a', s:1.5},
+    {x: 1160 + 180*Math.sin(t*0.27+4.0) + 40*Math.sin(t*0.83), y: 520 + 110*Math.sin(t*0.39+1), c:'#6aa7d9', s:1.3}
+  ];
+  if(t>26) list.push({x: 760 + 260*Math.sin(t*0.22+2.4), y: 360 + 60*Math.sin(t*0.6), c:'#f5d56a', s:1.2});
+  list.forEach((b,i)=>{
+    const flap = Math.cos(Math.floor(t*12)*0.9 + i*2.1);   // on twos
+    const dir = Math.cos(t*0.33+i) >= 0 ? 1 : -1;
+    ctx.globalAlpha = fade; butterfly(b.x, b.y - (t>40 ? (t-40)*60*(i+1) : 0), 1.7*b.s, flap, b.c, dir); ctx.globalAlpha = 1;
+  });
+}
+
+/* ============================================================
+   WORLD EFFECTS: sun, sunbeams, mist, ground shadow, wind
+   ============================================================ */
+function sunAndHalo(t){
+  const p = sst(0,9,t), sx = 1230, sy = lerp(760, 470, p);
+  const g = ctx.createRadialGradient(sx,sy,0,sx,sy,700);
+  g.addColorStop(0,`rgba(255,246,214,${0.55+0.4*p})`); g.addColorStop(0.25,`rgba(255,214,150,${0.22+0.2*p})`); g.addColorStop(1,'rgba(255,200,130,0)');
+  ctx.save(); ctx.globalCompositeOperation='screen'; ctx.fillStyle=g; ctx.fillRect(0,WT,W,WH); ctx.restore();
+  if(sy<640){ ctx.fillStyle='#fff7e0'; ctx.beginPath(); ctx.arc(sx,sy,30,0,7); ctx.fill(); }
+}
+function beam(x0,y0,x1,y1,w0,w1,alpha){
+  if(alpha<=0.003) return;
+  const dx=x1-x0, dy=y1-y0, L=Math.hypot(dx,dy), nx=-dy/L, ny=dx/L;
+  const g = ctx.createLinearGradient(x0,y0,x1,y1);
+  g.addColorStop(0,`rgba(255,240,200,${alpha})`); g.addColorStop(1,'rgba(255,230,170,0)');
+  ctx.save(); ctx.globalCompositeOperation='screen';
+  ctx.fillStyle=g; ctx.beginPath();
+  ctx.moveTo(x0+nx*w0/2, y0+ny*w0/2); ctx.lineTo(x1+nx*w1/2, y1+ny*w1/2);
+  ctx.lineTo(x1-nx*w1/2, y1-ny*w1/2); ctx.lineTo(x0-nx*w0/2, y0-ny*w0/2); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function mistBand(y,h,alpha,speed,seed,t){
+  for(let i=0;i<9;i++){
+    const w = 520 + hashU(seed+i)*420;
+    const x = ((hashU(seed*3+i)*W*1.4 + t*speed*(0.6+0.8*hashU(i+seed))) % (W+900)) - 450;
+    const yy = y + (hashU(seed*5+i)-0.5)*h;
+    const g = ctx.createRadialGradient(x,yy,0,x,yy,w);
+    g.addColorStop(0,`rgba(250,246,226,${alpha})`); g.addColorStop(1,'rgba(250,246,226,0)');
+    ctx.save(); ctx.translate(x,yy); ctx.scale(1,0.32); ctx.translate(-x,-yy);
+    ctx.fillStyle=g; ctx.fillRect(x-w,yy-w,2*w,2*w); ctx.restore();
+  }
+}
+function groundShadow(t){
+  const a = 0.5*(1 - sst(18,24,t));
+  if(a<=0.01) return;
+  const g = ctx.createRadialGradient(CX,GROUND,0,CX,GROUND,460);
+  g.addColorStop(0,`rgba(20,30,18,${a})`); g.addColorStop(1,'rgba(20,30,18,0)');
+  ctx.fillStyle=g; ctx.save(); ctx.translate(CX,GROUND); ctx.scale(1,0.16); ctx.translate(-CX,-GROUND); ctx.fillRect(CX-460,GROUND-460,920,920); ctx.restore();
+}
+// the ring of wind that spreads across the forest when the engines ignite
+function ringRx(t){ const u = clamp((t-34)/12); return lerp(60,1500,Math.pow(u,0.7)); }
+function windRing(t){
+  if(t<34 || t>46) return;
+  const u = clamp((t-34)/12), rx = ringRx(t), ry = rx*0.2;
+  ctx.save(); ctx.translate(CX,GROUND); ctx.lineCap='round';
+  for(let pass=0;pass<2;pass++){
+    ctx.strokeStyle = pass ? 'rgba(255,250,236,' + (0.55*(1-u)) + ')' : 'rgba(220,210,170,' + (0.22*(1-u)) + ')';
+    for(let i=0;i<72;i++){
+      const a0=i/72*Math.PI*2, a1=(i+1)/72*Math.PI*2;
+      ctx.lineWidth = (pass ? 3 : 14) * (0.4 + 1.2*hashU(i+3)) * (1-u*0.6);
+      ctx.beginPath(); ctx.moveTo(Math.cos(a0)*rx, Math.sin(a0)*ry); ctx.lineTo(Math.cos(a1)*rx, Math.sin(a1)*ry); ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+function grassBend(x,t){
+  let bend = 0;
+  if(t>=33 && t<=48){
+    const d = Math.abs(x-CX), rx = ringRx(t), u = clamp((t-34)/12);
+    bend = Math.exp(-Math.pow((d-rx)/140,2)) * 26 * (1-u) * Math.sign(x-CX);
+  }
+  return bend;
+}
+function drawGrass(t){
+  ctx.lineCap='round';
+  for(const b of GRASS){
+    const sway = Math.sin(t*1.25 + b.x*0.006)*5*(0.4+ (b.y-840)/190) ;
+    const tipX = b.x + b.lean + sway + grassBend(b.x,t);
+    ctx.strokeStyle=b.c; ctx.lineWidth=b.w;
+    ctx.beginPath(); ctx.moveTo(b.x,b.y); ctx.quadraticCurveTo(b.x+(tipX-b.x)*0.25, b.y-b.h*0.6, tipX, b.y-b.h); ctx.stroke();
+  }
+}
+
+/* ============================================================
+   SIMULATION: leaves, soil, birds, mist puffs, trail
+   (advanced in fixed steps so any time t is reproducible)
+   ============================================================ */
+let sim = null, sr = mulberry(777);
+const srnd = (a=0,b=1) => a + (b-a)*sr();
+function resetSim(){ sr = mulberry(777); sim = {t:0, acc:{}, leaves:[], debris:[], flock:[], puffs:[], trail:[], flockSpawned:false, lastTrail:-1}; }
+function rate(key,r,dt){ sim.acc[key]=(sim.acc[key]||0)+r*dt; if(sim.acc[key]>=1){ sim.acc[key]-=1; return true; } return false; }
+function advance(t){
+  if(!sim || t < sim.t - 1e-6) resetSim();
+  while(sim.t < t - 1e-6){ const dt = Math.min(1/48, t - sim.t); sim.t += dt; step(sim.t, dt); }
+}
+function leaf(x,y,vx,vy,sz,kind){
+  const pal=['#9cc16a','#6fa352','#d9b25e','#e7a14f','#c5d88a','#8fb865'];
+  return {x,y,vx,vy,sz,rot:srnd(0,6.28),spin:srnd(-2.5,2.5),ph:srnd(0,6.28),sw:srnd(1.2,2.4),amp:srnd(30,70),c:pal[(sr()*pal.length)|0],kind};
+}
+function robotPointWorld(t, st, name, lx, ly){
+  setRB(st); const P = pose(st.k, st.h);
+  const a = P.anc[name] || [0,P.mid];
+  return T([a[0]+lx, a[1]+ly]);
+}
+function step(t,dt){
+  const S = sim;
+  // ambient leaves drift down from the canopy
+  if(t>8 && rate('amb',0.9,dt)) S.leaves.push(leaf(srnd(0,W),srnd(60,250),srnd(-10,10),srnd(26,44),srnd(9,14),'amb'));
+  // the flock bursts out of the treetops when the robot's chest light is on and the ground trembles
+  if(t>=15.2 && !S.flockSpawned){
+    S.flockSpawned=true;
+    for(let i=0;i<26;i++) S.flock.push({x:srnd(480,1700), y:srnd(70,240), vx:srnd(-150,150), vy:srnd(-300,-170), ph:srnd(0,6), sc:srnd(0.7,1.25)});
+  }
+  for(const b of S.flock){ b.x+=b.vx*dt; b.y+=b.vy*dt; b.vx*=1-0.2*dt; b.ph+=dt*22; }
+  S.flock = S.flock.filter(b=>b.y>-500 && b.x>-300 && b.x<W+300);
+  // soil and vines pour out of the armour as it lifts
+  const ramp = sst(20,26,t)*(1-sst(36,40,t));
+  if(ramp>0 && rate('soil', 24*ramp, dt)){
+    const st = robotState(t);
+    const names = ['torso','shL','shR','thighL','thighR','kneeL','kneeR','headBack'];
+    const nm = names[(srnd()*names.length)|0];
+    const w = robotPointWorld(t, st, nm, srnd(-0.12,0.12), srnd(-0.08,0.08));
+    const soil = sr()<0.7;
+    S.debris.push({x:w[0], y:w[1], vx:srnd(-70,70), vy:-srnd(60,200), sz:srnd(4,11), rot:srnd(0,6), spin:srnd(-6,6), kind:soil?'soil':'leaf', c: soil ? ['#6a4f36','#8a6a48','#5b4530'][(sr()*3)|0] : '#7fa656', age:0, landed:false, ph:srnd(0,6), sw:srnd(1.4,2.6), amp:srnd(40,90)});
+  }
+  // mist-shedding leaves once the engines fire
+  if(t>40 && t<58 && rate('lleaf',2.6,dt)) S.leaves.push(leaf(srnd(850,1500), srnd(-40,160), srnd(-20,30), srnd(30,60), srnd(9,14), 'launch'));
+  // physics-light updates
+  for(const d of S.debris){
+    d.age+=dt;
+    if(d.kind==='leaf'){ d.ph+=dt*d.sw; d.x += (d.vx + Math.sin(d.ph)*d.amp)*dt; d.y += (d.vy<40?40:d.vy)*dt; d.rot+=d.spin*0.3*dt; }
+    else if(!d.landed){ d.vy += 900*dt; d.x += d.vx*dt; d.y += d.vy*dt; d.rot+=d.spin*dt;
+      if(d.y>GROUND){ d.y=GROUND; d.vy=-d.vy*0.25; d.vx*=0.6; if(Math.abs(d.vy)<40){ d.vy=0; d.landed=true; } } }
+  }
+  S.debris = S.debris.filter(d=>d.age<12 && d.y<WB+80);
+  // ambient and launch leaves
+  for(const l of S.leaves){ l.ph+=dt*l.sw; l.x += (l.vx + Math.sin(l.ph)*l.amp)*dt; l.y += l.vy*dt; l.rot += l.spin*dt; }
+  S.leaves = S.leaves.filter(l=>l.y<WB+60);
+  // launch trail and the mist it leaves behind
+  if(t>=38){
+    const st = robotState(t);
+    if(t-S.lastTrail>=0.1){ S.lastTrail=t; S.trail.push({x:st.x+st.L*0.0, y:GY-st.L, t}); }
+    S.trail = S.trail.filter(p=>t-p.t<5.5);
+    if(t<52 && rate('puff',5,dt)){
+      const p = S.trail[S.trail.length-1];
+      if(p) S.puffs.push({x:p.x+srnd(-30,30), y:p.y+srnd(-20,30), r:30, age:0, life:srnd(3,5), vx:srnd(-14,14)});
+    }
+  }
+  for(const p of S.puffs){ p.age+=dt; p.r+=40*dt; p.x+=p.vx*dt; }
+  S.puffs = S.puffs.filter(p=>p.age<p.life);
+}
+
+function robotState(t){
+  const tq = Math.floor(t*12)/12;                        // animated on twos
+  const k = Math.pow(sst(20,34,tq), 1.35);               // slow kneel-to-stand
+  const h = sst(26,34,tq);                               // head lifts toward the gap
+  const u = clamp((t-38)/20), L = 1500*Math.pow(u,1.8);  // launch
+  const q = sst(38,56,t);
+  return {k, h, L, s: lerp(1,0.32,q), rot: 0.32*sst(40,52,t), x: CX + 330*Math.pow(q,1.2)};
+}
+
+function shakeOffset(t){
+  const a = sst(15,17,t)*(1-sst(33,37,t))*7 + sst(37,40,t)*(1-sst(40,44,t))*5;
+  const q = Math.floor(t*12);
+  return {x:a*(hashU(q)-0.5)*2, y:a*(hashU(q+1000)-0.5)*2};
+}
+
+function drawParticles(t){
+  const S=sim;
+  // mist puffs (soft, under the leaves)
+  for(const p of S.puffs){
+    const al = 0.2*(1-p.age/p.life)*Math.min(1,p.age*3);
+    const g = ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,p.r);
+    g.addColorStop(0,`rgba(255,248,230,${al})`); g.addColorStop(1,'rgba(255,248,230,0)');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,7); ctx.fill();
+  }
+  // trail of light (a warm core with a wide mist halo, fading with age)
+  const pts = S.trail;
+  ctx.lineCap='round';
+  for(let i=1;i<pts.length;i++){
+    const a=pts[i-1], b=pts[i], age=t-b.t; if(age<0||age>5) continue;
+    const al = 1-age/5;
+    ctx.strokeStyle=`rgba(255,236,190,${0.3*al})`; ctx.lineWidth=46*al+8;
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+    ctx.strokeStyle=`rgba(255,252,236,${0.85*al})`; ctx.lineWidth=5*al+1;
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+  }
+  // debris: soil clods and small leaves
+  for(const d of S.debris){
+    if(d.kind==='leaf'){ drawLeaf(d.x,d.y,d.rot,d.ph,d.sz*0.9,d.c); continue; }
+    const pts = jitClod(d.sz);
+    ctx.save(); ctx.translate(d.x,d.y); ctx.rotate(d.rot);
+    smooth(pts); ctx.fillStyle=d.c; ctx.fill(); ctx.strokeStyle=INK; ctx.lineWidth=1; ctx.stroke();
+    ctx.restore();
+  }
+  // leaves
+  for(const l of S.leaves) drawLeaf(l.x,l.y,l.rot,l.ph,l.sz,l.c);
+  // flock
+  for(const b of S.flock) bird(b.x,b.y,1.6*b.sc,Math.sin(b.ph),b.vx>=0?1:-1,false,0);
+}
+function jitClod(sz){ const p=[]; for(let i=0;i<6;i++){ const a=i/6*Math.PI*2; const r=sz*(0.7+0.5*hashU(sz*13+i)); p.push([Math.cos(a)*r, Math.sin(a)*r*0.7]); } return p; }
+function drawLeaf(x,y,rot,ph,sz,c){
+  ctx.save(); ctx.translate(x,y); ctx.rotate(rot); ctx.scale(1, 0.25+0.75*Math.abs(Math.cos(ph*1.3)));
+  ctx.beginPath(); ctx.moveTo(-sz,0); ctx.quadraticCurveTo(-sz*0.2,-sz*0.75,sz,0); ctx.quadraticCurveTo(-sz*0.2,sz*0.75,-sz,0);
+  ctx.fillStyle=c; ctx.fill();
+  ctx.strokeStyle='rgba(40,50,30,.5)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(-sz*0.9,0); ctx.lineTo(sz*0.8,0); ctx.stroke();
+  ctx.restore();
+}
+
+/* ============================================================
+   FRAME
+   ============================================================ */
+function render(t){
+  advance(t);
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle='#050405'; ctx.fillRect(0,0,W,H);
+
+  const st = robotState(t);
+  const cam = Math.min(st.L*0.5, 700);                  // the camera climbs with the robot after launch
+  const sh = shakeOffset(t);
+  ctx.save();
+  ctx.translate(sh.x, sh.y + cam);
+
+  ctx.drawImage(BG, 0, WT);
+  sunAndHalo(t);
+  mistBand(640, 90, 0.16, 6, 3, t);
+  mistBand(790, 80, 0.14, 9, 9, t);
+
+  groundShadow(t);
+  // the robot
+  drawRobot(t, st);
+  // the bird that landed on the shoulder (or leaves it)
+  const bd = birdAt(t, st);
+  if(bd) bird(bd.x, bd.y, bd.sc, bd.flap, bd.dir, bd.perched, bd.turn||0);
+
+  // foreground painted layer over the robot's feet and the forest
+  ctx.drawImage(FRONT, 0, WT);
+  drawGrass(t);
+  mistBand(900, 120, 0.12, 5, 17, t);                   // low mist over the meadow
+
+  // sunbeams through the canopy gap, and the first ray on the robot's face
+  const bAlpha = (0.11 + 0.05*Math.sin(t*0.5)) * (1 - sst(44,52,t));
+  beam(1200,-60, 1120, 860, 40, 300, bAlpha);
+  beam(1280,-40, 1200, 860, 30, 200, bAlpha*0.7);
+  beam(1230,300, 1060,350, 26, 140, 0.32*sst(8,10,t));
+
+  drawParticles(t);
+  butterflies(t);
+  windRing(t);
+
+  ctx.restore();
+
+  // screen-space finish: warm grade, soft vignette, fine grain
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.save(); ctx.globalCompositeOperation='soft-light';
+  ctx.fillStyle='rgba(255,196,120,0.28)'; ctx.fillRect(0,0,W,H); ctx.restore();
+  const vg = ctx.createRadialGradient(W/2,H/2,H*0.35,W/2,H/2,W*0.62);
+  vg.addColorStop(0,'rgba(20,14,10,0)'); vg.addColorStop(1,'rgba(20,14,10,0.38)');
+  ctx.fillStyle=vg; ctx.fillRect(0,0,W,H);
+  if(GRAIN){ ctx.save(); ctx.globalAlpha=0.05; ctx.globalCompositeOperation='overlay'; ctx.fillStyle=ctx.createPattern(GRAIN,'repeat'); ctx.fillRect(0,0,W,H); ctx.restore(); }
+}
+
+/* ============================================================
+   PLAYBACK
+   ============================================================ */
+buildStatic();
+let playing = true, base = 0, t0 = performance.now(), ended = false;
+const endEl = document.getElementById('end'), hint = document.getElementById('hint');
+function now(){ return playing ? base + (performance.now()-t0)/1000 : base; }
+function pause(){ if(!playing) return; base = now(); playing = false; }
+function play(){ if(playing || ended) return; t0 = performance.now(); playing = true; }
+function restart(){ base = 0; t0 = performance.now(); playing = true; ended = false; endEl.classList.remove('on'); }
+cv.addEventListener('click', ()=>{ playing ? pause() : play(); hint.classList.add('off'); });
+window.addEventListener('keydown', e=>{ if(e.key==='r'||e.key==='R') restart(); if(e.key===' '){ e.preventDefault(); playing?pause():play(); } });
+function loop(){
+  let t = now();
+  if(t >= DUR){ t = DUR; if(!ended){ ended = true; base = DUR; playing = false; endEl.classList.add('on'); } }
+  render(t);
+  requestAnimationFrame(loop);
+}
+window.MK = { render, DUR, restart };
+if(typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
